@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -42,12 +41,28 @@ func (e *Entry) TombstoneEntry() *Entry {
 	}
 }
 
+func (e *Entry) verifyChecksum(checksum uint32) bool {
+	headerSize := 16
+	totalSize := headerSize + int(e.KeySize) + int(e.ValueSize)
+
+	buf := make([]byte, totalSize)
+
+	binary.LittleEndian.PutUint32(buf[4:8], e.TimeStamp)
+	binary.LittleEndian.PutUint32(buf[8:12], e.KeySize)
+	binary.LittleEndian.PutUint32(buf[12:16], e.ValueSize)
+
+	copy(buf[16:16+e.KeySize], e.Key)
+	copy(buf[16+e.KeySize:], e.Value)
+
+	return checksum == crc32.ChecksumIEEE(buf[4:])
+}
+
 func (e *Entry) Size() int {
-	return 12 + int(e.KeySize) + int(e.ValueSize)
+	return 16 + int(e.KeySize) + int(e.ValueSize)
 }
 
 func (e *Entry) Serialize() []byte {
-	headerSize := 20
+	headerSize := 16
 	totalSize := headerSize + int(e.KeySize) + int(e.ValueSize)
 
 	buf := make([]byte, totalSize)
@@ -179,26 +194,168 @@ func (sm *SegmentManager) Append(entry *Entry) (int, int64, error) {
 	return segment.id, offset, nil
 }
 
+func (sm *SegmentManager) Read(segmentID int, valuePos int64) (*Entry, error) {
+	path := sm.segments[segmentID].path
+
+	logfile, err := os.Open(path)
+	defer logfile.Close()
+
+	if err != nil {
+		return nil, fmt.Errorf("failed opening file at: %s", path)
+	}
+
+	_, err = logfile.Seek(valuePos, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	headerBuffer := make([]byte, 16)
+
+	_, err = logfile.Read(headerBuffer)
+	if err != nil {
+		return nil, fmt.Errorf("failed reading header: %w", err)
+	}
+
+	// read Headers
+	checksum := binary.LittleEndian.Uint32(headerBuffer[0:4])
+	timeStamp := binary.LittleEndian.Uint32(headerBuffer[4:8])
+	keySize := binary.LittleEndian.Uint32(headerBuffer[8:12])
+	valueSize := binary.LittleEndian.Uint32(headerBuffer[12:16])
+
+	// read Key
+	keyBuffer := make([]byte, keySize)
+	logfile.Read(keyBuffer)
+
+	// read Value
+	valueBuffer := make([]byte, valueSize)
+	_, err = logfile.Read(valueBuffer)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed reading Value from logfile: %w", err)
+	}
+
+	entry := &Entry{
+		TimeStamp: timeStamp,
+		KeySize:   keySize,
+		ValueSize: valueSize,
+		Key:       keyBuffer,
+		Value:     valueBuffer,
+	}
+
+	if !entry.verifyChecksum(checksum) {
+		return nil, fmt.Errorf("corrupted Entry. Checksums don't match")
+	}
+
+	return entry, nil
+}
+
+type HashTableEntry struct {
+	FieldID   int
+	ValueSize uint32
+	ValuePos  int64
+	Timestamp uint32
+}
+
+type HashTable struct {
+	mu    sync.Mutex
+	index map[string]*HashTableEntry
+}
+
+type Store struct {
+	mu             sync.RWMutex
+	hashTable      *HashTable
+	segmentManager *SegmentManager
+}
+
+func (s *Store) SET(key, value string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.segmentManager == nil {
+		return fmt.Errorf("store not properly initialized")
+	}
+
+	entry := &Entry{
+		TimeStamp: uint32(time.Now().Unix()),
+		KeySize:   uint32(len(key)),
+		ValueSize: uint32(len(value)),
+		Key:       []byte(key),
+		Value:     []byte(value),
+	}
+
+	segmentID, offset, err := s.segmentManager.Append(entry)
+
+	if err != nil {
+		return fmt.Errorf("failed appending entry to store: %w", err)
+	}
+
+	hashTableEntry := &HashTableEntry{
+		FieldID:   segmentID,
+		ValueSize: uint32(len(value)),
+		ValuePos:  offset,
+		Timestamp: uint32(time.Now().Unix()),
+	}
+
+	s.hashTable.index[key] = hashTableEntry
+
+	return nil
+}
+
+func (s *Store) GET(key string) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	hashTableEntry, found := s.hashTable.index[key]
+	if !found {
+		return "", fmt.Errorf("no entry found with key: %s", key)
+	}
+
+	logEntry, err := s.segmentManager.Read(hashTableEntry.FieldID, hashTableEntry.ValuePos)
+	if err != nil {
+		return "", fmt.Errorf("failed reading entry: %w", err)
+	}
+
+	return string(logEntry.Value), nil
+}
+
 func PUT(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("Received PUT request")
 }
 
 func main() {
-	/*
-		peersEnv := os.Getenv("PEERS")
-		peers := strings.Split(peersEnv, ",")
-		cluster := Cluster{make(map[string]*Node)}
-
-		for _, peer := range peers {
-			id := strings.Split(peer, ":")[0]
-			node := Node{ID: id, Address: peer}
-			cluster.PeerNodes[id] = &node
-		}
-	*/
-
-	http.HandleFunc("/PUT", PUT)
-	err := http.ListenAndServe(":9000", nil)
-	if err != nil {
-		log.Fatal("ListenAndServe: ", err)
+	segmentManager := &SegmentManager{
+		mu:       sync.Mutex{},
+		basePath: `C:\Users\arber\Coding\dkvsGo\logfiles`,
+		segments: make(map[int]*Segment),
+		activeID: 0,
+		nextID:   1,
 	}
+	err := segmentManager.createActiveSegment()
+	if err != nil {
+		fmt.Printf("Failed creating first segment: %w", err)
+		return
+	}
+
+	hashTable := &HashTable{
+		mu:    sync.Mutex{},
+		index: make(map[string]*HashTableEntry),
+	}
+
+	store := Store{
+		mu:             sync.RWMutex{},
+		hashTable:      hashTable,
+		segmentManager: segmentManager,
+	}
+
+	err = store.SET("Test", "Arber GOAT")
+	if err != nil {
+		fmt.Printf("Failed setting testValue: %v", err)
+	}
+
+	value, err := store.GET("Test")
+	if err != nil {
+		fmt.Printf("Failed getting testValue: %v", err)
+		return
+	}
+	fmt.Printf("FOUND VALUE: %s", value)
 }
