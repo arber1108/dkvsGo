@@ -1,355 +1,66 @@
 package main
 
 import (
-	"encoding/binary"
-	"errors"
 	"fmt"
-	"hash/crc32"
-	"net/http"
-	"os"
-	"path/filepath"
-	"sync"
-	"time"
 )
 
-/*
-type Node struct {
-	ID      string
-	Address string
-}
-
-type Cluster struct {
-	PeerNodes map[string]*Node
-}
-*/
-
-type Entry struct {
-	TimeStamp uint32
-	KeySize   uint32
-	ValueSize uint32
-	Key       []byte
-	Value     []byte
-}
-
-func (e *Entry) TombstoneEntry() *Entry {
-	return &Entry{
-		TimeStamp: uint32(time.Now().Unix()),
-		KeySize:   e.KeySize,
-		ValueSize: 0,
-		Key:       e.Key,
-		Value:     nil,
-	}
-}
-
-func (e *Entry) verifyChecksum(checksum uint32) bool {
-	headerSize := 16
-	totalSize := headerSize + int(e.KeySize) + int(e.ValueSize)
-
-	buf := make([]byte, totalSize)
-
-	binary.LittleEndian.PutUint32(buf[4:8], e.TimeStamp)
-	binary.LittleEndian.PutUint32(buf[8:12], e.KeySize)
-	binary.LittleEndian.PutUint32(buf[12:16], e.ValueSize)
-
-	copy(buf[16:16+e.KeySize], e.Key)
-	copy(buf[16+e.KeySize:], e.Value)
-
-	return checksum == crc32.ChecksumIEEE(buf[4:])
-}
-
-func (e *Entry) Size() int {
-	return 16 + int(e.KeySize) + int(e.ValueSize)
-}
-
-func (e *Entry) Serialize() []byte {
-	headerSize := 16
-	totalSize := headerSize + int(e.KeySize) + int(e.ValueSize)
-
-	buf := make([]byte, totalSize)
-
-	binary.LittleEndian.PutUint32(buf[4:8], e.TimeStamp)
-	binary.LittleEndian.PutUint32(buf[8:12], e.KeySize)
-	binary.LittleEndian.PutUint32(buf[12:16], e.ValueSize)
-
-	copy(buf[16:16+e.KeySize], e.Key)
-	copy(buf[16+e.KeySize:], e.Value)
-
-	checksum := crc32.ChecksumIEEE(buf[4:])
-
-	binary.LittleEndian.PutUint32(buf[0:4], checksum)
-
-	return buf
-}
-
-type Segment struct {
-	id         int
-	mu         sync.Mutex
-	path       string
-	file       *os.File
-	size       int64
-	entryCount int
-	maxSize    int64
-	maxEntries int
-	isActive   bool
-	isClosed   bool
-}
-
-var ErrSegmentClosed = errors.New("this Segment is Closed or not Active")
-
-var ErrSegmentFull = errors.New("this Segment is Full")
-
-func (s *Segment) Append(entry *Entry) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.isClosed || !s.isActive {
-		return 0, ErrSegmentClosed
-	}
-
-	if s.size >= s.maxSize || s.entryCount >= s.maxEntries {
-		s.isActive = false
-		return 0, ErrSegmentFull
-	}
-
-	data := entry.Serialize()
-	offset := s.size
-
-	_, err := s.file.Write(data)
-	if err != nil {
-		return 0, fmt.Errorf("failed to write entry: %w", err)
-	}
-
-	s.size += int64(len(data))
-	s.entryCount++
-
-	return offset, nil
-}
-
-type SegmentManager struct {
-	mu       sync.Mutex
-	basePath string
-	segments map[int]*Segment
-	activeID int
-	nextID   int
-}
-
-func (sm *SegmentManager) createActiveSegment() error {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	fullPath := filepath.Join(sm.basePath, fmt.Sprintf("%04d.log", sm.nextID))
-
-	file, err := os.Create(fullPath)
-	if err != nil {
-		return fmt.Errorf("failed creating segment: %w", err)
-	}
-
-	segment := &Segment{
-		id:         sm.nextID,
-		path:       fullPath,
-		file:       file,
-		size:       0,
-		entryCount: 0,
-		maxSize:    10 * 1024 * 1024, // 10 MB
-		maxEntries: 100_000,
-		isActive:   true,
-		isClosed:   false,
-	}
-	sm.segments[sm.nextID] = segment
-	sm.activeID = sm.nextID
-	sm.nextID++
-
-	return nil
-}
-
-func (sm *SegmentManager) Append(entry *Entry) (int, int64, error) {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	if sm.activeID == 0 {
-		return 0, 0, fmt.Errorf("no active segment")
-	}
-
-	segment, exists := sm.segments[sm.activeID]
-
-	if !exists {
-		return 0, 0, fmt.Errorf("active segment %d not found", sm.activeID)
-	}
-
-	offset, err := segment.Append(entry)
-	if err != nil {
-		if errors.Is(err, ErrSegmentFull) {
-			if err := sm.createActiveSegment(); err != nil {
-				return 0, 0, nil
-			}
-			segment = sm.segments[sm.activeID]
-			offset, err = segment.Append(entry)
-			if err != nil {
-				return 0, 0, err
-			}
-		} else {
-			return 0, 0, err
-		}
-	}
-	return segment.id, offset, nil
-}
-
-func (sm *SegmentManager) Read(segmentID int, valuePos int64) (*Entry, error) {
-	path := sm.segments[segmentID].path
-
-	logfile, err := os.Open(path)
-	defer logfile.Close()
-
-	if err != nil {
-		return nil, fmt.Errorf("failed opening file at: %s", path)
-	}
-
-	_, err = logfile.Seek(valuePos, 0)
-	if err != nil {
-		return nil, err
-	}
-
-	headerBuffer := make([]byte, 16)
-
-	_, err = logfile.Read(headerBuffer)
-	if err != nil {
-		return nil, fmt.Errorf("failed reading header: %w", err)
-	}
-
-	// read Headers
-	checksum := binary.LittleEndian.Uint32(headerBuffer[0:4])
-	timeStamp := binary.LittleEndian.Uint32(headerBuffer[4:8])
-	keySize := binary.LittleEndian.Uint32(headerBuffer[8:12])
-	valueSize := binary.LittleEndian.Uint32(headerBuffer[12:16])
-
-	// read Key
-	keyBuffer := make([]byte, keySize)
-	logfile.Read(keyBuffer)
-
-	// read Value
-	valueBuffer := make([]byte, valueSize)
-	_, err = logfile.Read(valueBuffer)
-
-	if err != nil {
-		return nil, fmt.Errorf("failed reading Value from logfile: %w", err)
-	}
-
-	entry := &Entry{
-		TimeStamp: timeStamp,
-		KeySize:   keySize,
-		ValueSize: valueSize,
-		Key:       keyBuffer,
-		Value:     valueBuffer,
-	}
-
-	if !entry.verifyChecksum(checksum) {
-		return nil, fmt.Errorf("corrupted Entry. Checksums don't match")
-	}
-
-	return entry, nil
-}
-
-type HashTableEntry struct {
-	FieldID   int
-	ValueSize uint32
-	ValuePos  int64
-	Timestamp uint32
-}
-
-type HashTable struct {
-	mu    sync.Mutex
-	index map[string]*HashTableEntry
-}
-
-type Store struct {
-	mu             sync.RWMutex
-	hashTable      *HashTable
-	segmentManager *SegmentManager
-}
-
-func (s *Store) SET(key, value string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.segmentManager == nil {
-		return fmt.Errorf("store not properly initialized")
-	}
-
-	entry := &Entry{
-		TimeStamp: uint32(time.Now().Unix()),
-		KeySize:   uint32(len(key)),
-		ValueSize: uint32(len(value)),
-		Key:       []byte(key),
-		Value:     []byte(value),
-	}
-
-	segmentID, offset, err := s.segmentManager.Append(entry)
-
-	if err != nil {
-		return fmt.Errorf("failed appending entry to store: %w", err)
-	}
-
-	hashTableEntry := &HashTableEntry{
-		FieldID:   segmentID,
-		ValueSize: uint32(len(value)),
-		ValuePos:  offset,
-		Timestamp: uint32(time.Now().Unix()),
-	}
-
-	s.hashTable.index[key] = hashTableEntry
-
-	return nil
-}
-
-func (s *Store) GET(key string) (string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	hashTableEntry, found := s.hashTable.index[key]
-	if !found {
-		return "", fmt.Errorf("no entry found with key: %s", key)
-	}
-
-	logEntry, err := s.segmentManager.Read(hashTableEntry.FieldID, hashTableEntry.ValuePos)
-	if err != nil {
-		return "", fmt.Errorf("failed reading entry: %w", err)
-	}
-
-	return string(logEntry.Value), nil
-}
-
-func PUT(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("Received PUT request")
-}
-
 func main() {
-	segmentManager := &SegmentManager{
-		mu:       sync.Mutex{},
-		basePath: `C:\Users\arber\Coding\dkvsGo\logfiles`,
-		segments: make(map[int]*Segment),
-		activeID: 0,
-		nextID:   1,
-	}
-	err := segmentManager.createActiveSegment()
+	/*
+		segmentManager := &SegmentManager{
+			mu:       sync.Mutex{},
+			basePath: `C:\Users\arber\Coding\dkvsGo\logfiles`,
+			segments: make(map[int]*Segment),
+			activeID: 0,
+			nextID:   1,
+		}
+		err := segmentManager.createActiveSegment()
+		if err != nil {
+			fmt.Printf("Failed creating first segment: %w", err)
+			return
+		}
+
+		hashTable := &HashTable{
+			mu:    sync.Mutex{},
+			index: make(map[string]*HashTableEntry),
+		}
+
+		store := Store{
+			mu:             sync.RWMutex{},
+			hashTable:      hashTable,
+			segmentManager: segmentManager,
+		}
+
+
+		err = store.SET("Test", "Arber GOAT")
+		if err != nil {
+			fmt.Printf("Failed setting testValue: %v", err)
+		}
+
+		value, err := store.GET("Test")
+		if err != nil {
+			fmt.Printf("Failed getting testValue: %v", err)
+			return
+		}
+		fmt.Printf("FOUND VALUE: %s \n", value)
+
+		err = store.SET("Test", "NEW VALUE")
+		if err != nil {
+			fmt.Printf("Failed setting new value: %v", err)
+		}
+
+	*/
+	store := Store{}
+	_, err := store.recoverStore()
+
 	if err != nil {
-		fmt.Printf("Failed creating first segment: %w", err)
+		fmt.Printf("Failed recovering store: %v", err)
 		return
 	}
 
-	hashTable := &HashTable{
-		mu:    sync.Mutex{},
-		index: make(map[string]*HashTableEntry),
-	}
-
-	store := Store{
-		mu:             sync.RWMutex{},
-		hashTable:      hashTable,
-		segmentManager: segmentManager,
-	}
-
-	err = store.SET("Test", "Arber GOAT")
+	err = store.SET("Test", "BLABALLAB")
 	if err != nil {
-		fmt.Printf("Failed setting testValue: %v", err)
+		fmt.Printf("Failed setting value: %v", err)
+		return
 	}
 
 	value, err := store.GET("Test")
@@ -357,5 +68,5 @@ func main() {
 		fmt.Printf("Failed getting testValue: %v", err)
 		return
 	}
-	fmt.Printf("FOUND VALUE: %s", value)
+	fmt.Printf("FOUND VALUE: %s \n", value)
 }
