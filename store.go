@@ -186,16 +186,9 @@ func (sm *SegmentManager) Append(entry *Entry) (int, int64, error) {
 }
 
 func (sm *SegmentManager) Read(segmentID int, valuePos int64) (*Entry, error) {
-	path := sm.segments[segmentID].path
+	logfile := sm.segments[segmentID].file
 
-	logfile, err := os.Open(path)
-	defer logfile.Close()
-
-	if err != nil {
-		return nil, fmt.Errorf("failed opening file at: %s", path)
-	}
-
-	_, err = logfile.Seek(valuePos, 0)
+	_, err := logfile.Seek(valuePos, 0)
 	if err != nil {
 		return nil, err
 	}
