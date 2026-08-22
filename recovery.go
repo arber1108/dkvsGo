@@ -67,11 +67,20 @@ func (s *Store) recoverStore() ([]*Entry, error) {
 
 		pathToLogfile := filepath.Join(segmentManager.basePath, logFile.Name())
 
-		file, fileOpenErr := os.Open(pathToLogfile)
-		fileInfo, _ := file.Stat()
+		flags := os.O_RDONLY
+		if segmentID == segmentManager.activeID {
+			flags = os.O_RDWR | os.O_APPEND
+		}
 
+		file, fileOpenErr := os.OpenFile(pathToLogfile, flags, 0)
 		if fileOpenErr != nil {
-			return nil, fmt.Errorf("failed parsing logfile name to int: %w", fileOpenErr)
+			return nil, fmt.Errorf("failed opening logfile %s: %w", pathToLogfile, fileOpenErr)
+		}
+
+		fileInfo, statErr := file.Stat()
+		if statErr != nil {
+			file.Close()
+			return nil, fmt.Errorf("failed reading logfile metadata %s: %w", pathToLogfile, statErr)
 		}
 		segment := &Segment{
 			id:         segmentID,
