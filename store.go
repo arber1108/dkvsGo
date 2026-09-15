@@ -92,7 +92,7 @@ func (s *Segment) Append(entry *Entry) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.isClosed || !s.isActive {
+	if s.isClosed {
 		return 0, ErrSegmentClosed
 	}
 
@@ -123,13 +123,13 @@ type SegmentManager struct {
 	nextID   int
 }
 
-func (sm *SegmentManager) createActiveSegment() error {
+func (sm *SegmentManager) createSegment(active bool) (*Segment, error) {
 
 	fullPath := filepath.Join(sm.basePath, fmt.Sprintf("%04d.log", sm.nextID))
 
 	file, err := os.Create(fullPath)
 	if err != nil {
-		return fmt.Errorf("failed creating segment: %w", err)
+		return nil, fmt.Errorf("failed creating segment: %w", err)
 	}
 
 	segment := &Segment{
@@ -140,14 +140,16 @@ func (sm *SegmentManager) createActiveSegment() error {
 		entryCount: 0,
 		maxSize:    maxFileSize,
 		maxEntries: maxSegmentEntries,
-		isActive:   true,
+		isActive:   active,
 		isClosed:   false,
 	}
-	sm.segments[sm.nextID] = segment
-	sm.activeID = sm.nextID
-	sm.nextID++
 
-	return nil
+	sm.segments[sm.nextID] = segment
+	if active {
+		sm.activeID = sm.nextID
+	}
+	sm.nextID++
+	return segment, nil
 }
 
 func (sm *SegmentManager) Append(entry *Entry) (int, int64, error) {
@@ -155,7 +157,7 @@ func (sm *SegmentManager) Append(entry *Entry) (int, int64, error) {
 	defer sm.mu.Unlock()
 
 	if sm.activeID == 0 {
-		err := sm.createActiveSegment()
+		_, err := sm.createSegment(true)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -170,7 +172,7 @@ func (sm *SegmentManager) Append(entry *Entry) (int, int64, error) {
 	offset, err := segment.Append(entry)
 	if err != nil {
 		if errors.Is(err, ErrSegmentFull) {
-			if err := sm.createActiveSegment(); err != nil {
+			if _, err := sm.createSegment(true); err != nil {
 				return 0, 0, nil
 			}
 			segment = sm.segments[sm.activeID]
@@ -234,7 +236,7 @@ func (sm *SegmentManager) Read(segmentID int, valuePos int64) (*Entry, error) {
 }
 
 type HashTableEntry struct {
-	FieldID   int
+	SegmentID int
 	ValueSize uint32
 	ValuePos  int64
 	Timestamp uint32
@@ -247,7 +249,7 @@ type HashTable struct {
 
 func (ht *HashTable) Put(key string, segmentID int, offset int64, valueSize, timeStamp uint32) {
 	hashTableEntry := &HashTableEntry{
-		FieldID:   segmentID,
+		SegmentID: segmentID,
 		ValueSize: valueSize,
 		ValuePos:  offset,
 		Timestamp: timeStamp,
@@ -305,7 +307,7 @@ func (s *Store) GET(key string) (string, error) {
 		return "", fmt.Errorf("no entry found with key: %s", key)
 	}
 
-	logEntry, err := s.segmentManager.Read(hashTableEntry.FieldID, hashTableEntry.ValuePos)
+	logEntry, err := s.segmentManager.Read(hashTableEntry.SegmentID, hashTableEntry.ValuePos)
 	if err != nil {
 		return "", fmt.Errorf("failed reading entry: %w", err)
 	}
